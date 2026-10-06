@@ -1,0 +1,368 @@
+/**
+ * TunnelVision LLM Sidecar
+ *
+ * Direct API calls to user-configured LLM + embedding endpoints. Config lives in
+ * extension_settings.TunnelVision.sidecarProfile / .embeddingProfile — each object
+ * carries its OWN apiKey. No SillyTavern secrets are read, so allowKeysExposure is
+ * not required (issue #29). Three call formats: openai-compatible, anthropic, google.
+ *
+ * Falls back to ST's generateRaw (handled by callers) when the sidecar is not enabled.
+ */
+
+import { getSettings } from './tree-store.js';
+import { SIDECAR_DEFAULT_TIMEOUT_MS, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_COOLDOWN_MS } from './constants.js';
+
+const MODULE_NAME = 'TunnelVision';
+const THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
+
+// ─── Circuit Breaker ────────────────────────────────────────────────
+// Opens after BREAKER_THRESHOLD consecutive sidecarGenerate failures; a single
+// success resets it. Prevents hammering a misconfigured endpoint.
+//
+// The breaker re-closes on its own after BREAKER_COOLDOWN_MS. A slow or flaky
+// provider trips it in three turns, and without a cooldown the sidecar would
+// stay dead for the rest of the page session — including after the provider
+// recovered — with the user seeing only that it silently stopped working.
+const BREAKER_THRESHOLD = CIRCUIT_BREAKER_THRESHOLD;
+const BREAKER_COOLDOWN_MS = CIRCUIT_BREAKER_COOLDOWN_MS;
+let _failureCount = 0;
+let _breakerOpen = false;
+let _breakerOpenedAt = 0;
+
+// ─── In-flight fetch tracking ────────────────────────────────────────
+// Only fetches started inside a retrieval scope are abortable. This keeps
+// ST's stop button from cancelling an in-flight sidecar *writer* (a memory
+// write), which would silently drop it. _fetchJson registers its controller
+// while the scope is open; abortSidecarFetches() aborts those on GENERATION_STOPPED.
+// ponytail: a depth counter, not a bool — safe if a scope ever nests
+const _activeFetches = new Set();
+let _retrievalScopeDepth = 0;
+
+/** Mark the start of retrieval network work; fetches started now are abortable. */
+export function beginRetrievalScope() { _retrievalScopeDepth++; }
+
+/** Mark the end of retrieval network work. Floors at 0 so it can't underflow. */
+export function endRetrievalScope() { _retrievalScopeDepth = Math.max(0, _retrievalScopeDepth - 1); }
+
+/** True while retrieval network work is in flight (ST is blocked on our handler). */
+export function isRetrievalScopeOpen() { return _retrievalScopeDepth > 0; }
+
+/** Abort every in-flight retrieval fetch. Called when the user stops generation. */
+export function abortSidecarFetches() {
+    for (const controller of _activeFetches) controller.abort();
+}
+
+export function resetCircuitBreaker() {
+    _failureCount = 0;
+    _breakerOpen = false;
+    _breakerOpenedAt = 0;
+}
+
+function _recordFailure() {
+    _failureCount += 1;
+    if (_failureCount >= BREAKER_THRESHOLD) {
+        _breakerOpen = true;
+        _breakerOpenedAt = Date.now();
+        console.warn(`[TunnelVision] Sidecar circuit breaker OPEN after ${_failureCount} consecutive failures — retrying in ${Math.round(BREAKER_COOLDOWN_MS / 60_000)} min. Check the Sidecar LLM endpoint if this repeats.`);
+    }
+}
+
+function _recordSuccess() {
+    resetCircuitBreaker();
+}
+
+/**
+ * True when the breaker has tripped and the cooldown has not yet elapsed.
+ * Distinguishes "temporarily broken" from "unconfigured". Expiring the cooldown
+ * here means the next call goes through and either succeeds (closing the
+ * breaker) or fails (re-opening it) — a half-open probe without a scheduler.
+ */
+export function isCircuitOpen() {
+    if (_breakerOpen && Date.now() - _breakerOpenedAt >= BREAKER_COOLDOWN_MS) {
+        console.debug('[TunnelVision] Sidecar circuit breaker cooldown elapsed — retrying sidecar on next call.');
+        _breakerOpen = false;
+        _failureCount = BREAKER_THRESHOLD - 1; // one more failure re-opens it
+    }
+    return _breakerOpen;
+}
+
+// ─── Config Resolution ──────────────────────────────────────────────
+
+/**
+ * Resolve the sidecar generation config from settings. apiKey may be empty
+ * (local endpoints such as llama.cpp, KoboldCpp, Ollama and LM Studio serve
+ * an OpenAI-compatible API with no auth), so only the endpoint is required.
+ * @returns {{endpoint:string, apiKey:string, model:string, format:string, maxTokens:number, temperature:number}|null}
+ */
+export function getSidecarConfig() {
+    const p = getSettings()?.sidecarProfile;
+    if (!p || typeof p !== 'object') return null;
+    if (!p.enabled) return null;
+    const endpoint = String(p.endpoint || '').trim();
+    const apiKey = String(p.apiKey || '').trim();
+    if (!endpoint) return null;
+    return {
+        endpoint,
+        apiKey,
+        model: String(p.model || '').trim(),
+        format: String(p.format || 'openai').trim().toLowerCase(),
+        maxTokens: typeof p.maxTokens === 'number' ? p.maxTokens : 1000,
+        temperature: typeof p.temperature === 'number' ? p.temperature : 0.3,
+    };
+}
+
+/** True when sidecar is fully configured and the circuit breaker is closed. */
+export function isSidecarConfigured() {
+    return !isCircuitOpen() && getSidecarConfig() !== null;
+}
+
+/** Display label for the activity feed. */
+export function getSidecarModelLabel() {
+    const config = getSidecarConfig();
+    if (!config) return null;
+    return config.model || 'sidecar';
+}
+
+/**
+ * Resolve the embedding config from settings. apiKey may be empty (local endpoints).
+ * @returns {{endpoint:string, apiKey:string, model:string, format:string}|null}
+ */
+export function getEmbeddingConfig() {
+    const p = getSettings()?.embeddingProfile;
+    if (!p || typeof p !== 'object') return null;
+    if (!p.enabled) return null;
+    const endpoint = String(p.endpoint || '').trim();
+    if (!endpoint) return null;
+    return {
+        endpoint,
+        apiKey: String(p.apiKey || '').trim(),
+        model: String(p.model || '').trim(),
+        format: String(p.format || 'openai').trim().toLowerCase(),
+    };
+}
+
+/** True when an embedding endpoint is configured with a supported format. */
+export function isEmbeddingSupported() {
+    const config = getEmbeddingConfig();
+    if (!config) return false;
+    return ['openai', 'google', 'gemini'].includes(config.format);
+}
+
+// ─── HTTP helper ────────────────────────────────────────────────────
+
+async function _fetchJson(url, options, label) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, SIDECAR_DEFAULT_TIMEOUT_MS);
+    const tracked = _retrievalScopeDepth > 0;
+    if (tracked) _activeFetches.add(controller);
+    let response;
+    try {
+        response = await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+        if (error?.name === 'AbortError') {
+            if (timedOut) {
+                // A bare AbortError reads as "signal is aborted without reason" — name the timeout.
+                throw new Error(`${label} timed out after ${SIDECAR_DEFAULT_TIMEOUT_MS / 1000}s — the sidecar endpoint did not respond in time.`);
+            }
+            // External abort (user pressed stop) — tag it so callers stay quiet
+            // and the circuit breaker doesn't count it as a failure.
+            throw Object.assign(new Error(`${label} cancelled`), { name: 'TVAbortError', cancelled: true });
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        if (tracked) _activeFetches.delete(controller);
+    }
+    if (!response.ok) {
+        let detail = '';
+        try { detail = await response.text(); } catch { /* body may be absent */ }
+        if (detail && detail.length > 300) detail = detail.slice(0, 300) + '… (truncated)';
+        throw new Error(`${label} HTTP ${response.status}${detail ? ` — ${detail}` : ''}`);
+    }
+    return response.json();
+}
+
+// ─── Endpoint normalization ─────────────────────────────────────────
+
+function _normalizeChatEndpoint(endpoint) {
+    if (/\/chat\/completions$/.test(endpoint)) return endpoint;
+    if (/\/v\d+$/.test(endpoint)) return endpoint.replace(/\/+$/, '') + '/chat/completions';
+    return endpoint; // custom proxy path — use as-is
+}
+
+function _modelsBase(endpoint) {
+    const base = endpoint.replace(/\/+$/, '');
+    return /\/models$/.test(base) ? base : base + '/models';
+}
+
+// ─── Generation ─────────────────────────────────────────────────────
+
+/**
+ * Generate text via a direct API call using the configured sidecar profile.
+ * @param {{prompt:string, systemPrompt?:string}} opts
+ * @returns {Promise<string>}
+ */
+export async function sidecarGenerate({ prompt, systemPrompt }) {
+    if (isCircuitOpen()) {
+        throw new Error('Sidecar circuit breaker open — too many consecutive failures. Check the Sidecar LLM configuration.');
+    }
+    const config = getSidecarConfig();
+    if (!config) {
+        throw new Error('Sidecar not configured: enable and fill in the Sidecar LLM profile in TunnelVision settings.');
+    }
+    const { endpoint, apiKey, model, format, maxTokens, temperature } = config;
+    try {
+        let result;
+        if (format === 'anthropic') {
+            result = await _callAnthropic({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens });
+        } else if (format === 'google') {
+            result = await _callGoogle({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens });
+        } else {
+            result = await _callOpenAI({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens });
+        }
+        _recordSuccess();
+        return typeof result === 'string' ? result.replace(THINK_BLOCK_RE, '').trim() : result;
+    } catch (error) {
+        // A user-cancel is not an endpoint failure — don't push the breaker toward opening.
+        if (!error?.cancelled) _recordFailure();
+        throw error;
+    }
+}
+
+async function _callOpenAI({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens }) {
+    const url = _normalizeChatEndpoint(endpoint);
+    const headers = { 'Content-Type': 'application/json' };
+    // Omitted rather than sent empty: `Bearer ` with no credential is malformed,
+    // and a gateway in front of a local server may reject it on that basis.
+    // Matches _embedOpenAI, which already sets the header conditionally.
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    if (/openrouter\.ai/i.test(url)) {
+        headers['HTTP-Referer'] = 'https://sillytavern.app';
+        headers['X-Title'] = 'TunnelVision';
+    }
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
+    const data = await _fetchJson(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens }),
+    }, 'Sidecar');
+    return data.choices?.[0]?.message?.content || '';
+}
+
+async function _callAnthropic({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens }) {
+    const url = /\/messages$/.test(endpoint) ? endpoint : endpoint.replace(/\/+$/, '') + '/messages';
+    const data = await _fetchJson(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+            model,
+            max_tokens: maxTokens,
+            temperature,
+            system: systemPrompt || '',
+            messages: [{ role: 'user', content: prompt }],
+        }),
+    }, 'Sidecar');
+    const block = Array.isArray(data.content)
+        ? data.content.find(b => b.type === 'text' || typeof b.text === 'string')
+        : null;
+    return block?.text || '';
+}
+
+async function _callGoogle({ endpoint, apiKey, model, systemPrompt, prompt, temperature, maxTokens }) {
+    const url = `${_modelsBase(endpoint)}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const fullPrompt = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
+    const data = await _fetchJson(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+            generationConfig: { temperature, maxOutputTokens: maxTokens },
+        }),
+    }, 'Sidecar');
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+// ─── Embeddings ─────────────────────────────────────────────────────
+
+/**
+ * Compute embeddings for a batch of texts using the configured embedding profile.
+ * @param {string[]} texts
+ * @returns {Promise<number[][]>}
+ */
+export async function computeEmbeddings(texts) {
+    const config = getEmbeddingConfig();
+    if (!config) {
+        throw new Error('Embedding not configured: enable and fill in the Embedding profile in TunnelVision settings.');
+    }
+    const { endpoint, apiKey, model, format } = config;
+    if (format === 'google' || format === 'gemini') {
+        return _embedGoogle({ endpoint, apiKey, model, texts });
+    }
+    return _embedOpenAI({ endpoint, apiKey, model, texts });
+}
+
+async function _embedOpenAI({ endpoint, apiKey, model, texts }) {
+    const url = /\/embeddings$/.test(endpoint) ? endpoint : endpoint.replace(/\/+$/, '') + '/embeddings';
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const data = await _fetchJson(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model, input: texts }),
+    }, 'Embedding');
+    return (data.data || []).map(d => d.embedding);
+}
+
+async function _embedGoogle({ endpoint, apiKey, model, texts }) {
+    const url = `${_modelsBase(endpoint)}/${model}:batchEmbedContents?key=${encodeURIComponent(apiKey)}`;
+    const requests = texts.map(text => ({ model: `models/${model}`, content: { parts: [{ text }] } }));
+    const data = await _fetchJson(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requests }),
+    }, 'Embedding');
+    return (data.embeddings || []).map(e => e.values);
+}
+
+// ─── Connectivity tests ─────────────────────────────────────────────
+
+export async function testSidecarConnectivity() {
+    const config = getSidecarConfig();
+    if (!config) return { ok: false, message: 'No sidecar configuration to test.', latencyMs: 0 };
+    // An explicit user-run test is the reset point for the breaker — otherwise a tripped
+    // breaker short-circuits sidecarGenerate and the test can never report success.
+    resetCircuitBreaker();
+    const start = Date.now();
+    try {
+        const text = await sidecarGenerate({ prompt: 'Reply with the single word: OK' });
+        const latencyMs = Date.now() - start;
+        if (!text || !String(text).trim()) {
+            return { ok: false, message: 'Empty response from sidecar endpoint.', latencyMs };
+        }
+        return { ok: true, message: `Connected (${latencyMs} ms).`, latencyMs };
+    } catch (error) {
+        return { ok: false, message: `Connection failed: ${error.message}`, latencyMs: Date.now() - start };
+    }
+}
+
+export async function testEmbeddingConnectivity() {
+    const config = getEmbeddingConfig();
+    if (!config) return { ok: false, message: 'No embedding configuration to test.', latencyMs: 0 };
+    const start = Date.now();
+    try {
+        const vectors = await computeEmbeddings(['TunnelVision connectivity test']);
+        const latencyMs = Date.now() - start;
+        const dims = Array.isArray(vectors?.[0]) ? vectors[0].length : 0;
+        if (!dims) return { ok: false, message: 'Empty embedding response.', latencyMs };
+        return { ok: true, message: `Connected — ${config.model || 'model'} (dimensions: ${dims}).`, latencyMs };
+    } catch (error) {
+        return { ok: false, message: `Connection failed: ${error.message}`, latencyMs: Date.now() - start };
+    }
+}
